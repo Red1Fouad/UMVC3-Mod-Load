@@ -1,7 +1,5 @@
 # Build artifacts
 src/Loader/out/
-src/UMVC3.ModManager/bin/
-src/UMVC3.ModManager/obj/
 
 # User/game mod content (not loader source)
 Mods/

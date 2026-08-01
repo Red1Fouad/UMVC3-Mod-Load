@@ -3,6 +3,11 @@
 A mod loader for **Ultimate Marvel vs. Capcom 3** (Steam AppID 357190) that serves mods
 directly from their own folders — **without ever copying mod files into the game folder**.
 
+It was built mainly for the **UMVC3 Community Edition** mod (extra characters, clone
+engine, ColorExpansion), which relies on a mix of replaced `nativePCx64\...` files, `.asi`
+plugins, and root-level configs like `Characters.ini` — all of which the loader serves
+straight from the mod's own folder.
+
 **`src/Loader`** — the `dinput8.dll` proxy injected into the game at startup. A virtual
 file system (VFS) redirects the game's file reads to the first enabled mod that provides
 the same relative file, and it also loads the mod's `.asi` plugins and any runtime DLLs

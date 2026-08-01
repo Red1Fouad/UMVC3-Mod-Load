@@ -17,7 +17,7 @@ like `Characters.ini`, and INI-profile reads done by mod ASIs.
 The only files that ever go into the game folder are our small `dinput8.dll` proxy and a
 `mods.ini` manifest. Mod content stays where it is.
 
-## Requirements
+## Building Requirements
 
 - Windows 10/11, 64-bit
 - Ultimate Marvel vs. Capcom 3 (Steam), `umvc3.exe`

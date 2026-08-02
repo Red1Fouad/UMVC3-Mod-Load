@@ -7,6 +7,7 @@ $Mh   = Join-Path $Ld 'third_party\minhook'
 
 $Cc = 'C:\devkitPro\msys2\opt\bin\x86_64-w64-mingw32-gcc.exe'
 $Ar = 'C:\devkitPro\msys2\opt\bin\x86_64-w64-mingw32-ar.exe'
+$Wr = 'C:\devkitPro\msys2\opt\bin\x86_64-w64-mingw32-windres.exe'
 
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
@@ -32,5 +33,13 @@ Invoke-Cc @('-O2', '-Wall', '-I', (Join-Path $Mh 'include'), '-shared', '-static
     '-o', (Join-Path $Out 'dinput8.dll'),
     (Join-Path $Ld 'loader.c'), (Join-Path $Out 'libMinHook.a'), (Join-Path $Ld 'dinput8.def'))
 
+Write-Host '=== Building UMVC3ModManager.asi ==='
+& $Wr (Join-Path $Ld 'manager.rc') -o (Join-Path $Out 'manager_res.o')
+if ($LASTEXITCODE -ne 0) { throw 'windres failed' }
+Invoke-Cc @('-O2', '-Wall', '-shared', '-static-libgcc', '-s',
+    '-o', (Join-Path $Out 'UMVC3ModManager.asi'),
+    (Join-Path $Ld 'manager.c'), (Join-Path $Out 'manager_res.o'), '-lcomctl32', '-lgdi32')
+
 $size = (Get-Item (Join-Path $Out 'dinput8.dll')).Length
-Write-Host "DONE. Output: $Out\dinput8.dll ($size bytes)"
+$asiSize = (Get-Item (Join-Path $Out 'UMVC3ModManager.asi')).Length
+Write-Host "DONE. Output: $Out\dinput8.dll ($size bytes) + UMVC3ModManager.asi ($asiSize bytes)"

@@ -41,7 +41,21 @@ static wchar_t g_mods[MAX_MODS][MAX_PATH_LEN];
 static int     g_modCount   = 0;
 static BOOL    g_enabled    = FALSE;
 static BOOL    g_logging    = FALSE;
+static BOOL    g_managerEnabled = TRUE;   /* show mod manager GUI at startup */
 static HANDLE g_logHandle  = INVALID_HANDLE_VALUE;
+
+/* Mods the manager GUI has unchecked ([Disabled] section of mods.ini). */
+static wchar_t g_disabled[MAX_MODS][MAX_PATH_LEN];
+static int     g_disabledCount = 0;
+
+/* Loose-file mods ([ModFiles] section of mods.ini). A publisher who only ships
+   the mod file (no nativePCx64 folder) is cross-referenced against the game's
+   nativePCx64 by the manager, which saves the resolved mapping here: the
+   absolute path to the actual mod file, plus the game-relative virtual path it
+   replaces (e.g. nativePCx64\ui\mnchscmn_en.arc). */
+static wchar_t g_fmods[MAX_MODS][MAX_PATH_LEN];
+static wchar_t g_fmodsVirtual[MAX_MODS][MAX_PATH_LEN];
+static int     g_fmodCount = 0;
 
 /* Real function pointers (filled by MH_CreateHookApi). Must be declared before
    resolve_redirect, which uses the real GetFileAttributesW to avoid recursion. */
@@ -253,6 +267,14 @@ static void trim(wchar_t *s)
 
 static void parse_config(void)
 {
+    /* parse_config may run more than once (initial load in DllMain, then again
+       after the mod manager edits mods.ini), so start from a clean slate. */
+    g_modCount = 0;
+    g_disabledCount = 0;
+    g_enabled = FALSE;
+    g_logging = FALSE;
+    g_managerEnabled = TRUE;
+
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\%hs", g_moduleDir, CONFIG_NAME);
 
@@ -275,7 +297,7 @@ static void parse_config(void)
         return;
     text[textLen] = L'\0';
 
-    BOOL in_mods = FALSE;
+    int section = 0;   /* 0=none, 1=[Mods], 2=[Disabled], 3=[ModFiles] */
     wchar_t *ctx = NULL;
     wchar_t *line = wcstok(text, L"\n", &ctx);
     while (line != NULL)
@@ -288,12 +310,19 @@ static void parse_config(void)
         }
         if (line[0] == L'[')
         {
-            in_mods = (_wcsicmp(line, L"[Mods]") == 0);
+            if (_wcsicmp(line, L"[Mods]") == 0)
+                section = 1;
+            else if (_wcsicmp(line, L"[Disabled]") == 0)
+                section = 2;
+            else if (_wcsicmp(line, L"[ModFiles]") == 0)
+                section = 3;
+            else
+                section = 0;
             line = wcstok(NULL, L"\n", &ctx);
             continue;
         }
 
-        if (in_mods)
+        if (section == 1)
         {
             wchar_t *eq = wcschr(line, L'=');
             if (eq != NULL && g_modCount < MAX_MODS)
@@ -307,6 +336,44 @@ static void parse_config(void)
                 }
             }
         }
+        else if (section == 2)
+        {
+            wchar_t *eq = wcschr(line, L'=');
+            if (eq != NULL && g_disabledCount < MAX_MODS)
+            {
+                wchar_t *val = eq + 1;
+                trim(val);
+                if (val[0] != L'\0')
+                {
+                    wcscpy(g_disabled[g_disabledCount], val);
+                    g_disabledCount++;
+                }
+            }
+        }
+        else if (section == 3)
+        {
+            /* N=<absolute path to mod file>|<game-relative virtual path> */
+            wchar_t *eq = wcschr(line, L'=');
+            if (eq != NULL && g_fmodCount < MAX_MODS)
+            {
+                wchar_t *val = eq + 1;
+                trim(val);
+                wchar_t *pipe = wcschr(val, L'|');
+                if (pipe != NULL)
+                {
+                    *pipe = L'\0';
+                    trim(val);
+                    wchar_t *vpath = pipe + 1;
+                    trim(vpath);
+                    if (val[0] != L'\0' && vpath[0] != L'\0')
+                    {
+                        wcscpy(g_fmods[g_fmodCount], val);
+                        wcscpy(g_fmodsVirtual[g_fmodCount], vpath);
+                        g_fmodCount++;
+                    }
+                }
+            }
+        }
         else if (_wcsicmp(line, L"Enabled=0") == 0)
         {
             g_enabled = FALSE;
@@ -314,6 +381,10 @@ static void parse_config(void)
         else if (wcsncmp(line, L"Enabled=", 8) == 0)
         {
             g_enabled = TRUE;
+        }
+        else if (_wcsnicmp(line, L"Manager=", 8) == 0)
+        {
+            g_managerEnabled = parse_bool_value(line + 8);
         }
         else if (_wcsnicmp(line, L"Log=", 4) == 0)
         {
@@ -327,12 +398,57 @@ static void parse_config(void)
         line = wcstok(NULL, L"\n", &ctx);
     }
 
+    /* Drop mods listed in [Disabled]; keeps the remaining priority order. */
+    for (int i = 0; i < g_disabledCount; i++)
+    {
+        for (int j = 0; j < g_modCount; j++)
+        {
+            if (_wcsicmp(g_mods[j], g_disabled[i]) == 0)
+            {
+                log_line(L"mod disabled by manager: %ls", g_mods[j]);
+                for (int k = j; k < g_modCount - 1; k++)
+                    wcscpy(g_mods[k], g_mods[k + 1]);
+                g_modCount--;
+                j--;
+            }
+        }
+    }
+
+    /* Drop file mods that belong to a disabled mod folder. */
+    if (g_disabledCount > 0 && g_fmodCount > 0)
+    {
+        int n = 0;
+        for (int i = 0; i < g_fmodCount; i++)
+        {
+            BOOL disabled = FALSE;
+            for (int j = 0; j < g_disabledCount; j++)
+                if (_wcsnicmp(g_fmods[i], g_disabled[j], wcslen(g_disabled[j])) == 0)
+                {
+                    disabled = TRUE;
+                    break;
+                }
+            if (!disabled)
+            {
+                if (n != i)
+                {
+                    wcscpy(g_fmods[n], g_fmods[i]);
+                    wcscpy(g_fmodsVirtual[n], g_fmodsVirtual[i]);
+                }
+                n++;
+            }
+        }
+        g_fmodCount = n;
+    }
+
     /* Reference the marker so its ASCII bytes stay in the image (manager scans for it). */
     log_line(L"marker %hs", LOADER_MARKER);
 
-    log_line(L"config: enabled=%d mods=%d", g_enabled ? 1 : 0, g_modCount);
+    log_line(L"config: enabled=%d mods=%d filemods=%d",
+             g_enabled ? 1 : 0, g_modCount, g_fmodCount);
     for (int i = 0; i < g_modCount; i++)
         log_line(L"  mod[%d] = %ls", i, g_mods[i]);
+    for (int i = 0; i < g_fmodCount; i++)
+        log_line(L"  filemod[%d] %ls -> %ls", i, g_fmodsVirtual[i], g_fmods[i]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -391,6 +507,11 @@ static BOOL resolve_redirect(const wchar_t *requested, wchar_t *out, size_t outc
     if (_wcsicmp(rel, LOADER_DLL_NAME) == 0)
         return FALSE;
 
+    /* Never redirect the loader's own config or log files (the mod manager
+       reads/writes mods.ini from the game folder and must always see it). */
+    if (_wcsicmp(rel, L"mods.ini") == 0 || _wcsicmp(rel, L"mods_loader.log") == 0)
+        return FALSE;
+
     for (int i = 0; i < g_modCount; i++)
     {
         wchar_t cand[MAX_PATH_LEN];
@@ -402,6 +523,22 @@ static BOOL resolve_redirect(const wchar_t *requested, wchar_t *out, size_t outc
             wcsncpy(out, cand, outcap - 1);
             out[outcap - 1] = L'\0';
             return TRUE;
+        }
+    }
+
+    /* Loose-file mods: the manager cross-referenced the mod's single file
+       against the game's nativePCx64 and saved the virtual path here. */
+    for (int i = 0; i < g_fmodCount; i++)
+    {
+        if (_wcsicmp(rel, g_fmodsVirtual[i]) == 0)
+        {
+            DWORD attrs = RealGetFileAttributesW(g_fmods[i]);
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                wcsncpy(out, g_fmods[i], outcap - 1);
+                out[outcap - 1] = L'\0';
+                return TRUE;
+            }
         }
     }
 
@@ -1037,17 +1174,62 @@ static DWORD WINAPI diagnostic_thread(LPVOID param)
  * (preloaded at process attach): loading their .asi ourselves crashes them
  * (mag_patch: "Address contains an unsupported instruction").
  */
+/* Runs before anything else at startup: loads the mod manager GUI plugin
+   (UMVC3ModManager.asi) if it is deployed next to this DLL and calls its
+   exported UMVC3_ModManager_Show(). The GUI blocks the game's boot while the
+   user edits mods.ini. Returns without doing anything if the plugin is not
+   present. If the user cancels, the game process is terminated. */
+static void run_mod_manager(void)
+{
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%ls\\UMVC3ModManager.asi", g_moduleDir);
+
+    DWORD attrs = RealGetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return;
+
+    HMODULE m = LoadLibraryW(path);
+    if (m == NULL)
+    {
+        log_line(L"mod manager: load FAILED");
+        return;
+    }
+
+    typedef int (WINAPI *show_fn)(const wchar_t *gameDir);
+    show_fn show = (show_fn)GetProcAddress(m, "UMVC3_ModManager_Show");
+    if (show == NULL)
+    {
+        log_line(L"mod manager: export UMVC3_ModManager_Show not found");
+        return;
+    }
+
+    log_line(L"mod manager: opening GUI");
+    int launch = show(g_moduleDir);
+    log_line(L"mod manager: closed (launch=%d)", launch);
+    if (!launch)
+        ExitProcess(0);
+}
+
 static void load_plugins_deferred(void)
 {
     if (InterlockedCompareExchange(&g_pluginsLoaded, 1, 0) != 0)
         return;
+
+    /* Mod manager first so the user can enable/disable mods before anything is
+       loaded, then re-read mods.ini to pick up the changes. Shift-override:
+       holding Shift when the game starts re-opens the manager even if the
+       Manager= setting is off, so it can always be turned back on. */
+    if (g_managerEnabled || (GetAsyncKeyState(VK_SHIFT) & 0x8000))
+        run_mod_manager();
+    parse_config();
+
     if (!g_enabled)
         return;
 
     for (int i = 0; i < g_modCount; i++)
     {
         if (mod_has_loader(g_mods[i]))
-            log_line(L"mod has own loader; plugin loading delegated");
+            load_mod_loader(g_mods[i]);
         else
             load_plugins_from(g_mods[i]);
     }
@@ -1159,15 +1341,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         log_open();
         log_line(L"=== UMvC3 Mod Loader v1 ===");
         install_hooks();
-        if (g_enabled)
-        {
-            for (int i = 0; i < g_modCount; i++)
-            {
-                if (mod_has_loader(g_mods[i]))
-                    load_mod_loader(g_mods[i]);
-            }
-        }
-        log_line(L"loader ready (mod loaders preloaded, plugins deferred)");
+        log_line(L"loader ready (mod loaders + plugins deferred)");
     }
 
     return TRUE;

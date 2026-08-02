@@ -4,6 +4,12 @@ src/Loader/out/
 # User/game mod content (not loader source)
 Mods/
 
+# Local-only development notes
+DEVELOPMENT_NOTES.txt
+
+# Local builds / release bundles
+release/
+
 # Visual Studio / IDE
 .vs/
 *.user

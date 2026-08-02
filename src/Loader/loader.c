@@ -40,6 +40,7 @@ static wchar_t g_moduleDir[MAX_PATH];   /* directory of this DLL == game dir */
 static wchar_t g_mods[MAX_MODS][MAX_PATH_LEN];
 static int     g_modCount   = 0;
 static BOOL    g_enabled    = FALSE;
+static BOOL    g_logging    = FALSE;
 static HANDLE g_logHandle  = INVALID_HANDLE_VALUE;
 
 /* Real function pointers (filled by MH_CreateHookApi). Must be declared before
@@ -195,6 +196,9 @@ LPVOID WINAPI GetdfDIJoystick(void)
 
 static void log_open(void)
 {
+    if (!g_logging)
+        return;
+
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\%hs", g_moduleDir, LOG_NAME);
     g_logHandle = CreateFileW(path, FILE_APPEND_DATA,
@@ -225,6 +229,17 @@ static void log_line(const wchar_t *fmt, ...)
 /* ------------------------------------------------------------------ */
 
 static int is_space(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; }
+
+static BOOL parse_bool_value(const wchar_t *value)
+{
+    if (value == NULL || value[0] == L'\0')
+        return FALSE;
+    if (value[0] == L'1' || value[0] == L'T' || value[0] == L't')
+        return TRUE;
+    if (value[0] == L'0' || value[0] == L'F' || value[0] == L'f')
+        return FALSE;
+    return _wcsicmp(value, L"true") == 0 || _wcsicmp(value, L"yes") == 0 || _wcsicmp(value, L"on") == 0;
+}
 
 static void trim(wchar_t *s)
 {
@@ -299,6 +314,14 @@ static void parse_config(void)
         else if (wcsncmp(line, L"Enabled=", 8) == 0)
         {
             g_enabled = TRUE;
+        }
+        else if (_wcsnicmp(line, L"Log=", 4) == 0)
+        {
+            g_logging = parse_bool_value(line + 4);
+        }
+        else if (_wcsnicmp(line, L"Logging=", 8) == 0)
+        {
+            g_logging = parse_bool_value(line + 8);
         }
 
         line = wcstok(NULL, L"\n", &ctx);
@@ -1132,9 +1155,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     {
         DisableThreadLibraryCalls(hinstDLL);
         init_module_dir();
+        parse_config();
         log_open();
         log_line(L"=== UMvC3 Mod Loader v1 ===");
-        parse_config();
         install_hooks();
         if (g_enabled)
         {

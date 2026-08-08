@@ -327,7 +327,8 @@ static void write_mods_ini(void)
                 g_fileMods[i].file[p] == L'\\')
                 known = TRUE;
         }
-        if (known)
+        /* Only keep the mapping if the file still exists on disk. */
+        if (known && GetFileAttributesW(g_fileMods[i].file) != INVALID_FILE_ATTRIBUTES)
         {
             if (fmWrote == 0)
                 len += _snwprintf(out + len, 8191 - len, L"\r\n[ModFiles]\r\n");
@@ -605,6 +606,21 @@ static void scan_mods_folder(void)
             }
         if (!dup)
             g_mods[n++] = g_mods[i];
+    }
+    g_modCount = n;
+
+    /* Drop stale entries: a mod whose folder was deleted but is still listed in
+       mods.ini must not be loaded, and must be pruned from mods.ini on save. */
+    n = 0;
+    for (int i = 0; i < g_modCount; i++)
+    {
+        DWORD attrs = GetFileAttributesW(g_mods[i].path);
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            mgr_log(L"scan: dropping missing mod folder %ls", g_mods[i].path);
+            continue;
+        }
+        g_mods[n++] = g_mods[i];
     }
     g_modCount = n;
 

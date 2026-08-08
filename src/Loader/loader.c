@@ -265,6 +265,17 @@ static void trim(wchar_t *s)
     while (n > 0 && is_space(s[n - 1])) s[--n] = L'\0';
 }
 
+/* Real attribute lookup that never re-enters our own hooks: during DllMain the
+   hooks aren't installed yet (RealGetFileAttributesW is NULL, so GetFileAttributesW
+   is already the real function); after install_hooks the "real" pointer is set and
+   we can use it directly to avoid an extra resolve_redirect round trip. */
+static DWORD real_attributes_w(const wchar_t *path)
+{
+    if (RealGetFileAttributesW != NULL)
+        return RealGetFileAttributesW(path);
+    return GetFileAttributesW(path);
+}
+
 static void parse_config(void)
 {
     /* parse_config may run more than once (initial load in DllMain, then again
@@ -436,6 +447,48 @@ static void parse_config(void)
                 }
                 n++;
             }
+        }
+        g_fmodCount = n;
+    }
+
+    /* Drop mods whose folder no longer exists on disk (the user deleted a mod
+       folder but mods.ini still lists it). Without this the loader would keep
+       trying to serve files / load plugins from a gone folder. */
+    {
+        int n = 0;
+        for (int i = 0; i < g_modCount; i++)
+        {
+            DWORD attrs = real_attributes_w(g_mods[i]);
+            if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                log_line(L"mod missing on disk, skipping: %ls", g_mods[i]);
+                continue;
+            }
+            if (n != i)
+                wcscpy(g_mods[n], g_mods[i]);
+            n++;
+        }
+        g_modCount = n;
+    }
+
+    /* Drop loose-file mods whose actual file no longer exists. */
+    {
+        int n = 0;
+        for (int i = 0; i < g_fmodCount; i++)
+        {
+            DWORD attrs = real_attributes_w(g_fmods[i]);
+            if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                log_line(L"file mod missing on disk, skipping: %ls -> %ls",
+                         g_fmodsVirtual[i], g_fmods[i]);
+                continue;
+            }
+            if (n != i)
+            {
+                wcscpy(g_fmods[n], g_fmods[i]);
+                wcscpy(g_fmodsVirtual[n], g_fmodsVirtual[i]);
+            }
+            n++;
         }
         g_fmodCount = n;
     }
@@ -1076,6 +1129,12 @@ static void log_mod_modules(const wchar_t *modDir)
 
 static void load_plugins_from(const wchar_t *modDir)
 {
+    if (RealGetFileAttributesW(modDir) == INVALID_FILE_ATTRIBUTES)
+    {
+        log_line(L"skip plugins: mod folder missing: %ls", modDir);
+        return;
+    }
+
     /* Mirror Ultimate ASI Loader: set CWD to the folder holding the plugins so
        ASIs that use relative paths (logs, configs) resolve them correctly. */
     wchar_t oldDir[MAX_PATH_LEN];
@@ -1228,6 +1287,11 @@ static void load_plugins_deferred(void)
 
     for (int i = 0; i < g_modCount; i++)
     {
+        if (RealGetFileAttributesW(g_mods[i]) == INVALID_FILE_ATTRIBUTES)
+        {
+            log_line(L"skip mod: folder missing: %ls", g_mods[i]);
+            continue;
+        }
         if (mod_has_loader(g_mods[i]))
             load_mod_loader(g_mods[i]);
         else

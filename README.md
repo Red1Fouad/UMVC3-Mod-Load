@@ -49,16 +49,10 @@ Output: `src\Loader\out\dinput8.dll` and `src\Loader\out\UMVC3ModManager.asi`.
 
 ## Usage
 
-1. Copy `src\Loader\out\dinput8.dll` **and** `src\Loader\out\UMVC3ModManager.asi` into the
-   game folder (`...\steamapps\common\ULTIMATE MARVEL VS. CAPCOM 3\`).
-2. Create `mods.ini` next to them (see below), or skip it — the mod manager will create it
-   on first launch.
-3. Launch the game from Steam (`steam://rungameid/357190` so Steam DRM/achievements keep
-   working). The **mod manager** opens *before* the game boots: enable/disable and reorder
-   mods, then press **Launch Game** to continue or **Exit** to abort the launch.
-
-To remove the loader, delete `dinput8.dll`, `UMVC3ModManager.asi` and `mods.ini` from the
-game folder. Only one `dinput8.dll` proxy may be present at a time.
+1. Extract `dinput8.dll` and `UMVC3ModManager.asi` next to the game's `umvc3.exe`.
+2. Put your mods in a `Mods` folder next to `umvc3.exe`. If it doesn't exist, create it.
+3. Launch the game. The mod manager window opens first: enable/disable and reorder mods,
+   then press **Launch Game**.
 
 ### Mod manager (`UMVC3ModManager.asi`)
 

@@ -1,22 +1,38 @@
 # UMVC3 Mod Loader
 
-A mod loader for **Ultimate Marvel vs. Capcom 3** (Steam AppID 357190) that serves mods
-directly from their own folders — **without ever copying mod files into the game folder**.
+A mod loader for **Ultimate Marvel vs. Capcom 3** that serves mods directly from their own
+folders — nothing is ever copied into the game folder. It loads each mod's `.asi` plugins
+and redirects the game's file reads (`nativePCx64\...`, root-level configs, INI-profile
+reads) to the first enabled mod that provides the same file. The only files you add next to
+`umvc3.exe` are `dinput8.dll` and `UMVC3ModManager.asi`; a `mods.ini` manifest is generated
+on first launch.
 
-It was built mainly for the [**UMVC3 Community Edition**](https://www.nexusmods.com/ultimatemarvelvscapcom3/mods/286) mod (extra characters, clone
-engine, ColorExpansion), which relies on a mix of replaced `nativePCx64\...` files, `.asi`
-plugins, and root-level configs like `Characters.ini` — all of which the loader serves
-straight from the mod's own folder.
+## Usage
 
-**`src/Loader`** — the `dinput8.dll` proxy injected into the game at startup. A virtual
-file system (VFS) redirects the game's file reads to the first enabled mod that provides
-the same relative file, and it also loads the mod's `.asi` plugins and any runtime DLLs
-they need (e.g. debug CRT). It understands `nativePCx64\...` content, root-level configs
-like `Characters.ini`, and INI-profile reads done by mod ASIs.
+1. Extract `dinput8.dll` and `UMVC3ModManager.asi` next to the game's `umvc3.exe`.
+2. Put your mods in a `Mods` folder next to `umvc3.exe`. If it doesn't exist, create it.
+3. Launch the game. The mod manager window opens first: enable/disable and reorder mods,
+   then press **Launch Game**.
 
-The only files you add to the game folder are the `dinput8.dll` proxy and the
-`UMVC3ModManager.asi` plugin; a `mods.ini` manifest is generated next to them on first
-launch. Mod content stays where it is.
+### Mod manager (`UMVC3ModManager.asi`)
+
+The loader loads this plugin at startup and it shows a small window where you can manage
+mods without touching `mods.ini` by hand:
+
+- **Checkbox** next to each mod enables/disables it (written to a `[Disabled]` section).
+- **Move Up / Move Down** change a mod's priority. Order *is* the priority: the first mod in
+  the list that provides a file wins, so **top of the list is highest priority** (index 1).
+- **Refresh** re-scans the game folder's `Mods\` directory for newly added mods.
+- **Enable all mods (master switch)** is the same as `Enabled=` in the ini.
+- The window always opens on launch (it writes `Manager=1`). Holding **Shift** while
+  launching the game forces it open regardless.
+- Mods are auto-discovered from the game folder's `Mods\` directory. If a mod ships a
+  `nativePCx64\...` tree, the folder that directly contains `nativePCx64` is used as the mod
+  root automatically.
+- **Loose-file mods** (a publisher ships the mod file alone, no `nativePCx64` folder) are
+  cross-referenced against the game's `nativePCx64` once; the mapping is saved to a
+  `[ModFiles]` section in `mods.ini` so the file is served from the mod folder.
+- The manager writes `mods.ini` for you when the window closes.
 
 ## Building Requirements
 
@@ -47,33 +63,6 @@ src\Loader\build.cmd
 ```
 
 Output: `src\Loader\out\dinput8.dll` and `src\Loader\out\UMVC3ModManager.asi`.
-
-## Usage
-
-1. Extract `dinput8.dll` and `UMVC3ModManager.asi` next to the game's `umvc3.exe`.
-2. Put your mods in a `Mods` folder next to `umvc3.exe`. If it doesn't exist, create it.
-3. Launch the game. The mod manager window opens first: enable/disable and reorder mods,
-   then press **Launch Game**.
-
-### Mod manager (`UMVC3ModManager.asi`)
-
-The loader loads this plugin at startup and it shows a small window where you can manage
-mods without touching `mods.ini` by hand:
-
-- **Checkbox** next to each mod enables/disables it (written to a `[Disabled]` section).
-- **Move Up / Move Down** change a mod's priority. Order *is* the priority: the first mod in
-  the list that provides a file wins, so **top of the list is highest priority** (index 1).
-- **Refresh** re-scans the game folder's `Mods\` directory for newly added mods.
-- **Enable all mods (master switch)** is the same as `Enabled=` in the ini.
-- The window always opens on launch (it writes `Manager=1`). Holding **Shift** while
-  launching the game forces it open regardless.
-- Mods are auto-discovered from the game folder's `Mods\` directory. If a mod ships a
-  `nativePCx64\...` tree, the folder that directly contains `nativePCx64` is used as the mod
-  root automatically.
-- **Loose-file mods** (a publisher ships the mod file alone, no `nativePCx64` folder) are
-  cross-referenced against the game's `nativePCx64` once; the mapping is saved to a
-  `[ModFiles]` section in `mods.ini` so the file is served from the mod folder.
-- The manager writes `mods.ini` for you when the window closes.
 
 ## Mod folder layout
 

@@ -14,8 +14,9 @@ the same relative file, and it also loads the mod's `.asi` plugins and any runti
 they need (e.g. debug CRT). It understands `nativePCx64\...` content, root-level configs
 like `Characters.ini`, and INI-profile reads done by mod ASIs.
 
-The only files that ever go into the game folder are our small `dinput8.dll` proxy and a
-`mods.ini` manifest. Mod content stays where it is.
+The only files you add to the game folder are the `dinput8.dll` proxy and the
+`UMVC3ModManager.asi` plugin; a `mods.ini` manifest is generated next to them on first
+launch. Mod content stays where it is.
 
 ## Building Requirements
 
@@ -76,8 +77,9 @@ mods without touching `mods.ini` by hand:
 
 ## Mod folder layout
 
-A mod is a folder that mirrors the game root. Anything the game reads from
-`<game>\...` is looked up first in each enabled mod in priority order.
+A mod is a folder that mirrors the game root, placed in the `Mods\` folder next to
+`umvc3.exe`. Anything the game reads from `<game>\...` is looked up first in each enabled
+mod in priority order.
 
 ```
 MyMod\
@@ -95,9 +97,9 @@ MyMod\
   dinput8.dll           # optional: the mod's own loader
 ```
 
-Mods can live anywhere on disk — `mods.ini` points the loader at them. Matching is done on
-the game-relative path, so `MyMod\nativePCx64\ui\mnchs_en.arc` overrides the game's
-`ui\mnchs_en.arc`, and `MyMod\Characters.ini` satisfies an ASI's `.\Characters.ini` read.
+Matching is done on the game-relative path, so `MyMod\nativePCx64\ui\mnchs_en.arc`
+overrides the game's `ui\mnchs_en.arc`, and `MyMod\Characters.ini` satisfies an ASI's
+`.\Characters.ini` read.
 
 ## `mods.ini`
 
@@ -138,8 +140,9 @@ game-relative path (right of `|`).
 ## Troubleshooting
 
 - **Game still boots without mods:** make sure `dinput8.dll` in the game folder is ours
-  (contains the marker `UMVC3-MOD-LOADER-v1`), `mods.ini` lists absolute paths that exist,
-  and `Enabled=1`.
+  (contains the marker `UMVC3-MOD-LOADER-v1`), `UMVC3ModManager.asi` is next to it, your
+  mods are in the `Mods` folder next to `umvc3.exe`, and they're enabled in the manager.
 - **A different mod manager's `dinput8.dll` is in the game folder:** remove it first; only
   one proxy can be active.
-- **Diagnostics:** the loader writes `mods_loader.log` next to the game exe on each run.
+- **Diagnostics:** set `Log=1` in `mods.ini` to have the loader write `mods_loader.log`
+  next to the game exe.

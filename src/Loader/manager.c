@@ -3,7 +3,7 @@
  *
  * The loader (dinput8.dll) loads this .asi from the game folder before the
  * game boots and calls the exported UMVC3_ModManager_Show(). The GUI blocks
- * the game's startup while the user edits mods.ini: "Launch Game" continues
+ * the game's startup while the user edits mods.ini: "Start" continues
  * the boot, "Exit" aborts it.
  *
  * Modeled on the MZZXLC Mod Loader GUI:
@@ -23,7 +23,7 @@
  *   [Loader]
  *   Version=1
  *   Enabled=1        <- master switch (checkbox)
- *   Manager=1        <- show this window on launch (checkbox)
+ *   Manager=1        <- window always shows on launch
  *   Logging=0        <- preserved from previous runs
  *
  *   [Mods]           <- every known mod, in priority order (1 wins)
@@ -38,6 +38,8 @@
 
 #define UNICODE
 #define _UNICODE
+#define WINVER       0x0600
+#define _WIN32_WINNT 0x0600
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
@@ -52,7 +54,6 @@
 
 #define IDC_LIST       101
 #define IDC_MASTER     102
-#define IDC_SHOWNEXT   103
 #define IDC_REFRESH    104
 #define IDC_UP         105
 #define IDC_EXIT       106
@@ -82,7 +83,6 @@ static int      g_modCount      = 0;
 static FileMod  g_fileMods[MAX_MODS];
 static int      g_fileModCount  = 0;
 static BOOL     g_masterEnabled = TRUE;
-static BOOL     g_showNextTime  = TRUE;
 static BOOL     g_logging       = FALSE;
 static wchar_t  g_baseDir[MAX_PATH_LEN];
 static wchar_t  g_configPath[MAX_PATH_LEN];
@@ -104,9 +104,17 @@ static BOOL     g_gameIndexBuilt = FALSE;
 static HWND g_hwnd     = NULL;
 static HWND g_list     = NULL;
 static HWND g_master   = NULL;
-static HWND g_showNext = NULL;
 static HWND g_status   = NULL;
 static HWND g_hint     = NULL;
+static HWND g_startBtn = NULL;
+
+/* The Start button is owner-drawn so it can be green; the subclass gives it a
+   hand cursor and a hover highlight on top of the stock pressed state. */
+static WNDPROC g_startPrevProc = NULL;
+static BOOL    g_startHover    = FALSE;
+
+static HFONT g_font     = NULL;
+static HFONT g_boldFont = NULL;
 
 static int g_threadResult = FALSE;
 
@@ -168,7 +176,6 @@ static BOOL read_mods_ini(void)
     g_modCount = 0;
     g_fileModCount = 0;
     g_masterEnabled = TRUE;
-    g_showNextTime = TRUE;
     g_logging = FALSE;
 
     HANDLE h = CreateFileW(g_configPath, GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -266,8 +273,6 @@ static BOOL read_mods_ini(void)
         }
         else if (_wcsnicmp(line, L"Enabled=", 8) == 0)
             g_masterEnabled = parse_bool(line + 8);
-        else if (_wcsnicmp(line, L"Manager=", 8) == 0)
-            g_showNextTime = parse_bool(line + 8);
         else if (_wcsnicmp(line, L"Logging=", 8) == 0)
             g_logging = parse_bool(line + 8);
         else if (_wcsnicmp(line, L"Log=", 4) == 0)
@@ -289,8 +294,8 @@ static void write_mods_ini(void)
     wchar_t out[8192];
     int len = 0;
     len += _snwprintf(out + len, 8191 - len,
-                      L"[Loader]\r\nVersion=1\r\nEnabled=%d\r\nManager=%d\r\nLogging=%d\r\n",
-                      g_masterEnabled ? 1 : 0, g_showNextTime ? 1 : 0, g_logging ? 1 : 0);
+                      L"[Loader]\r\nVersion=1\r\nEnabled=%d\r\nManager=1\r\nLogging=%d\r\n",
+                      g_masterEnabled ? 1 : 0, g_logging ? 1 : 0);
     len += _snwprintf(out + len, 8191 - len, L"\r\n[Mods]\r\n");
     for (int i = 0; i < g_modCount; i++)
         len += _snwprintf(out + len, 8191 - len, L"%d=%ls\r\n", i + 1, g_mods[i].path);
@@ -656,6 +661,22 @@ static void update_status(void)
     SetWindowTextW(g_status, buf);
 }
 
+/* Shorten an absolute mod path to start at the Mods folder (which sits next to
+   the ASI): "C:\...\Mods\MyMod" -> "Mods\MyMod". */
+static void path_for_display(const wchar_t *path, wchar_t *out, size_t cap)
+{
+    size_t base = wcslen(g_baseDir);
+    if (base > 0 && _wcsnicmp(path, g_baseDir, base) == 0)
+    {
+        const wchar_t *rel = path + base;
+        while (*rel == L'\\')
+            rel++;
+        _snwprintf(out, cap, L"%ls", rel);
+        return;
+    }
+    _snwprintf(out, cap, L"%ls", path);
+}
+
 static void rebuild_list(void)
 {
     if (g_list == NULL)
@@ -666,6 +687,9 @@ static void rebuild_list(void)
         const wchar_t *slash = wcsrchr(g_mods[i].path, L'\\');
         const wchar_t *name = slash != NULL ? slash + 1 : g_mods[i].path;
 
+        wchar_t disp[MAX_PATH_LEN];
+        path_for_display(g_mods[i].path, disp, MAX_PATH_LEN);
+
         LVITEMW item;
         ZeroMemory(&item, sizeof(item));
         item.mask = LVIF_TEXT | LVIF_PARAM;
@@ -674,7 +698,7 @@ static void rebuild_list(void)
         item.pszText = (LPWSTR)name;
         item.lParam = i;
         ListView_InsertItem(g_list, &item);
-        ListView_SetItemText(g_list, i, 1, g_mods[i].path);
+        ListView_SetItemText(g_list, i, 1, disp);
         ListView_SetCheckState(g_list, i, g_mods[i].enabled ? TRUE : FALSE);
     }
     update_status();
@@ -723,6 +747,56 @@ static void on_move(int delta)
     SetFocus(g_list);
 }
 
+static void init_font(void)
+{
+    g_font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (g_font == NULL)
+        g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    g_boldFont = CreateFontW(-12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (g_boldFont == NULL)
+        g_boldFont = g_font;
+}
+
+static void free_font(void)
+{
+    if (g_boldFont != NULL && g_boldFont != g_font)
+        DeleteObject(g_boldFont);
+    if (g_font != NULL && g_font != (HFONT)GetStockObject(DEFAULT_GUI_FONT))
+        DeleteObject(g_font);
+    g_boldFont = NULL;
+    g_font = NULL;
+}
+
+/* Keep the Path column filling whatever width the window is resized to. */
+static void layout_list_columns(void)
+{
+    if (g_list == NULL)
+        return;
+    RECT rc;
+    GetClientRect(g_list, &rc);
+    int w = (rc.right - rc.left) - GetSystemMetrics(SM_CXVSCROLL) - 8;
+    if (w < 120)
+        w = 120;
+    int c0 = 300;
+    if (w > 640)
+    {
+        c0 = w * 2 / 5;
+        if (c0 > 420)
+            c0 = 420;
+    }
+    int c1 = w - c0;
+    if (c1 < 120)
+        c1 = 120;
+    ListView_SetColumnWidth(g_list, 0, c0);
+    ListView_SetColumnWidth(g_list, 1, c1);
+}
+
 static void layout_controls(HWND hwnd)
 {
     if (g_list == NULL)
@@ -734,33 +808,117 @@ static void layout_controls(HWND hwnd)
     int margin = 8;
     int y = margin;
 
+    /* Top row: master switch, hint, and the status label right-aligned. */
     MoveWindow(g_master, margin, y, 300, 20, TRUE);
+    if (g_status != NULL)
+        MoveWindow(g_status, w - margin - 180, y, 180, 20, TRUE);
     if (g_hint != NULL)
-        MoveWindow(g_hint, margin + 306, y, w - 2 * margin - 306, 20, TRUE);
-    y += 24;
-    MoveWindow(g_showNext, margin, y, 220, 20, TRUE);
+    {
+        int hintX = margin + 306;
+        int hintW = w - margin - 180 - 6 - hintX;
+        if (hintW < 0)
+            hintW = 0;
+        MoveWindow(g_hint, hintX, y, hintW, 20, TRUE);
+    }
     y += 24;
 
-    int btnW = 90, btnH = 26;
+    int btnW = 90, btnH = 26, gap = 6, launchW = btnW + 18;
     int listBottom = h - margin - btnH - 10;
     if (listBottom <= y)
         listBottom = y + 100;
     MoveWindow(g_list, margin, y, w - 2 * margin, listBottom - y, TRUE);
     y = listBottom + 6;
 
+    /* Bottom row: buttons only, left and right groups anchored to the edges so
+       nothing overlaps regardless of window width. */
     MoveWindow(GetDlgItem(hwnd, IDC_REFRESH), margin, y, btnW, btnH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_UP), margin + btnW + 6, y, btnW, btnH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_DOWN), margin + 2 * (btnW + 6), y, btnW, btnH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_UP), margin + btnW + gap, y, btnW, btnH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_DOWN), margin + 2 * (btnW + gap), y, btnW, btnH, TRUE);
 
-    int x = w - margin - 2 * btnW - 6;
+    int x = w - margin - btnW - gap - launchW;
     MoveWindow(GetDlgItem(hwnd, IDC_EXIT), x, y, btnW, btnH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_LAUNCH), x + btnW + 6, y, btnW, btnH, TRUE);
+    MoveWindow(g_startBtn, x + btnW + gap, y, launchW, btnH, TRUE);
 
-    int statusX = margin + 3 * (btnW + 6);
-    int statusW = x - statusX - 6;
-    if (statusW < 60)
-        statusW = 60;
-    MoveWindow(g_status, statusX, y, statusW, btnH, TRUE);
+    layout_list_columns();
+}
+
+static void draw_start_button(DRAWITEMSTRUCT *dis)
+{
+    BOOL pressed  = (dis->itemState & ODS_SELECTED) != 0;
+    BOOL focused  = (dis->itemState & ODS_FOCUS) != 0;
+    BOOL disabled = (dis->itemState & ODS_DISABLED) != 0;
+    BOOL hot      = g_startHover && !pressed && !disabled;
+
+    COLORREF bg = disabled ? RGB(150, 150, 150)
+                : pressed  ? RGB(34, 128, 58)
+                : hot      ? RGB(64, 198, 94)
+                           : RGB(46, 164, 79);
+
+    HDC hdc = dis->hDC;
+    RECT rc = dis->rcItem;
+
+    HBRUSH fill = CreateSolidBrush(bg);
+    HPEN   edge = CreatePen(PS_SOLID, 1, RGB(28, 118, 52));
+    HGDIOBJ oldBrush = SelectObject(hdc, fill);
+    HGDIOBJ oldPen   = SelectObject(hdc, edge);
+    RoundRect(hdc, rc.left, rc.top, rc.right - 1, rc.bottom - 1, 5, 5);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(edge);
+    DeleteObject(fill);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_boldFont);
+    RECT tr = rc;
+    InflateRect(&tr, -2, -2);
+    DrawTextW(hdc, L"Start", -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont);
+
+    if (focused)
+    {
+        RECT fr = rc;
+        InflateRect(&fr, -4, -4);
+        DrawFocusRect(hdc, &fr);
+    }
+}
+
+static LRESULT CALLBACK start_btn_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_MOUSEMOVE:
+    {
+        TRACKMOUSEEVENT tme;
+        ZeroMemory(&tme, sizeof(tme));
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        TrackMouseEvent(&tme);
+        if (!g_startHover)
+        {
+            g_startHover = TRUE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    }
+    case WM_MOUSELEAVE:
+        if (g_startHover)
+        {
+            g_startHover = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(NULL, IDC_HAND));
+        return TRUE;
+    case WM_ERASEBKGND:
+        /* We paint the whole button (background included) in WM_DRAWITEM, so
+           skip the class-brush erase to avoid gray flashing behind the green
+           fill while the window is being resized. */
+        return TRUE;
+    }
+    return CallWindowProcW(g_startPrevProc, hwnd, msg, wParam, lParam);
 }
 
 static LRESULT CALLBACK manager_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -779,11 +937,18 @@ static LRESULT CALLBACK manager_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             break;
         case IDC_EXIT:
         case IDC_LAUNCH:
-            g_showNextTime = (SendMessageW(g_showNext, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        case IDCANCEL:
             g_masterEnabled = (SendMessageW(g_master, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_threadResult = (LOWORD(wParam) == IDC_LAUNCH);
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
             break;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT *)lParam)->CtlID == IDC_LAUNCH)
+        {
+            draw_start_button((DRAWITEMSTRUCT *)lParam);
+            return TRUE;
         }
         break;
     case WM_NOTIFY:
@@ -802,6 +967,9 @@ static LRESULT CALLBACK manager_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
     case WM_SIZE:
         layout_controls(hwnd);
+        /* Synchronously repaint the whole window and its children so the
+           owner-drawn Start button stays in sync while the window is dragged. */
+        RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         break;
     case WM_CLOSE:
         mgr_log(L"close: saving mods=%d filemods=%d launch=%d", g_modCount, g_fileModCount,
@@ -835,23 +1003,20 @@ static void create_window(HINSTANCE hInst)
     int x = (cx - ww) / 2;
     int y = (cy - wh) / 3;
 
+    g_startHover = FALSE;
+
     g_hwnd = CreateWindowExW(0, L"UMVC3ModManagerWnd", L"UMVC3 Mod Manager",
                              WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                              x, y, ww, wh, NULL, NULL, hInst, NULL);
 
-    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    init_font();
+    HFONT font = g_font;
 
     g_master = CreateWindowW(L"BUTTON", L"Enable all mods (master switch)",
                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                              0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_MASTER, hInst, NULL);
     SendMessageW(g_master, BM_SETCHECK, g_masterEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_master, WM_SETFONT, (WPARAM)font, TRUE);
-
-    g_showNext = CreateWindowW(L"BUTTON", L"Show this window on launch",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_SHOWNEXT, hInst, NULL);
-    SendMessageW(g_showNext, BM_SETCHECK, g_showNextTime ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(g_showNext, WM_SETFONT, (WPARAM)font, TRUE);
 
     g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
@@ -874,14 +1039,21 @@ static void create_window(HINSTANCE hInst)
     col.iSubItem = 1;
     ListView_InsertColumn(g_list, 1, &col);
 
-    static const wchar_t *names[] = { L"Refresh", L"Move Up", L"Move Down", L"Exit", L"Launch Game" };
-    static const int ids[] = { IDC_REFRESH, IDC_UP, IDC_DOWN, IDC_EXIT, IDC_LAUNCH };
-    for (int i = 0; i < 5; i++)
+    static const wchar_t *names[] = { L"Refresh", L"Move Up", L"Move Down", L"Exit" };
+    static const int ids[] = { IDC_REFRESH, IDC_UP, IDC_DOWN, IDC_EXIT };
+    for (int i = 0; i < 4; i++)
     {
         HWND btn = CreateWindowW(L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                  0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)ids[i], hInst, NULL);
         SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
     }
+
+    g_startBtn = CreateWindowW(L"BUTTON", L"Start",
+                               WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
+                               0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_LAUNCH, hInst, NULL);
+    g_startPrevProc = (WNDPROC)SetWindowLongPtrW(g_startBtn, GWLP_WNDPROC,
+                                                 (LONG_PTR)start_btn_wndproc);
+    SendMessageW(g_startBtn, WM_SETFONT, (WPARAM)font, TRUE);
 
     g_status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                              0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_STATUS, hInst, NULL);
@@ -926,10 +1098,16 @@ __declspec(dllexport) int WINAPI UMVC3_ModManager_Show(const wchar_t *gameDir)
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        /* Dialog navigation: Tab moves between controls, Enter presses the
+           default (Start) button, ESC exits. */
+        if (!IsDialogMessageW(g_hwnd, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 
+    free_font();
     return g_threadResult;
 }
 

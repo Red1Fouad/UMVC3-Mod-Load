@@ -70,8 +70,8 @@ mods without touching `mods.ini` by hand:
   the list that provides a file wins, so **top of the list is highest priority** (index 1).
 - **Refresh** re-scans the game folder's `Mods\` directory for newly added mods.
 - **Enable all mods (master switch)** is the same as `Enabled=` in the ini.
-- **Show this window on launch** controls the `Manager=` setting. If you uncheck it, hold
-  **Shift** while launching the game to force the window open again.
+- The window always opens on launch (it writes `Manager=1`). Holding **Shift** while
+  launching the game forces it open regardless.
 - Mods are auto-discovered from the game folder's `Mods\` directory. If a mod ships a
   `nativePCx64\...` tree, the folder that directly contains `nativePCx64` is used as the mod
   root automatically.
@@ -126,9 +126,10 @@ Manager=1
 Set `Enabled=0` to disable all mods. Index `1` has the highest priority.
 
 The `[Mods]` section lists every known mod; entries in `[Disabled]` are skipped at load
-time (that's how the mod manager's checkboxes work). `Manager=0` skips the mod manager GUI
-on launch — hold **Shift** at launch to force it open anyway. You normally never edit this
-file by hand; the mod manager writes it for you.
+time (that's how the mod manager's checkboxes work). The mod manager always writes
+`Manager=1`, so the window shows on every launch — hold **Shift** at launch to force it
+open regardless. You normally never edit this file by hand; the mod manager writes it for
+you.
 
 The `[ModFiles]` section holds loose-file mappings from the mod manager's cross-referencing:
 

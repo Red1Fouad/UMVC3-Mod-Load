@@ -12,7 +12,7 @@ on first launch.
 1. Extract `dinput8.dll` and `UMVC3ModManager.asi` next to the game's `umvc3.exe`.
 2. Put your mods in a `Mods` folder next to `umvc3.exe`. If it doesn't exist, create it.
 3. Launch the game. The mod manager window opens first: enable/disable and reorder mods,
-   then press **Launch Game**.
+   then press **Start**.
 
 ### Mod manager (`UMVC3ModManager.asi`)
 

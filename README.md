@@ -24,6 +24,9 @@ mods without touching `mods.ini` by hand:
   the list that provides a file wins, so **top of the list is highest priority** (index 1).
 - **Refresh** re-scans the game folder's `Mods\` directory for newly added mods.
 - **Enable all mods (master switch)** is the same as `Enabled=` in the ini.
+- **Borderless fullscreen** checkbox runs the game in a borderless window that
+  covers your monitor instead of switching the display mode (instant alt-tab, no
+  resolution change). Equivalent to `Borderless=1` in the ini.
 - The window always opens on launch (it writes `Manager=1`). Holding **Shift** while
   launching the game forces it open regardless.
 - Mods are auto-discovered from the game folder's `Mods\` directory. If a mod ships a
@@ -99,6 +102,7 @@ Lower numbers win.
 Version=1
 Enabled=1
 Manager=1
+Borderless=0
 
 [Mods]
 1=C:\path\to\Mods\MyMod
@@ -109,6 +113,9 @@ Manager=1
 ```
 
 Set `Enabled=0` to disable all mods. Index `1` has the highest priority.
+
+`Borderless=1` makes the game run in a borderless fullscreen window instead of
+switching the display mode; `0` keeps the game's normal fullscreen behavior.
 
 The `[Mods]` section lists every known mod; entries in `[Disabled]` are skipped at load
 time (that's how the mod manager's checkboxes work). The mod manager always writes

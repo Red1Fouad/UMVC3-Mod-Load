@@ -16,6 +16,11 @@
  *     they need, e.g. debug CRT) directly from the mod folder, mirroring what
  *     the mods' own dinput8 loaders would do.
  *
+ *  3. BORDERLESS FULLSCREEN (optional, [Loader] Borderless=1)
+ *     Replaces the game's display-mode-switching fullscreen with a borderless
+ *     window that covers the monitor: the d3d9 device is forced windowed and
+ *     ChangeDisplaySettings fullscreen requests are swallowed.
+ *
  * The DINPUT8 exports themselves are forwarded to the real system dinput8.dll
  * by loading it from System32 and forwarding via GetProcAddress, so the game's
  * DirectInput usage is unaffected. (We cannot use .def forwarders: a forwarder
@@ -26,6 +31,7 @@
 #include <windows.h>
 #include <wchar.h>
 #include <stdio.h>
+#include <d3d9.h>
 #include "MinHook.h"
 
 #define MAX_MODS 128
@@ -42,6 +48,7 @@ static int     g_modCount   = 0;
 static BOOL    g_enabled    = FALSE;
 static BOOL    g_logging    = FALSE;
 static BOOL    g_managerEnabled = TRUE;   /* show mod manager GUI at startup */
+static BOOL    g_borderless   = FALSE;    /* borderless fullscreen instead of mode-switch fullscreen */
 static HANDLE g_logHandle  = INVALID_HANDLE_VALUE;
 
 /* Mods the manager GUI has unchecked ([Disabled] section of mods.ini). */
@@ -98,6 +105,7 @@ static BOOL  (WINAPI *RealWritePrivateProfileStringA)(LPCSTR, LPCSTR, LPCSTR, LP
 static BOOL  (WINAPI *RealWritePrivateProfileStringW)(LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR);
 
 static volatile LONG g_pluginsLoaded = 0;
+static volatile LONG g_standaloneLoaded = 0;
 
 /* Temp diagnostic counters */
 static volatile LONG g_readsSeen  = 0;
@@ -285,6 +293,7 @@ static void parse_config(void)
     g_enabled = FALSE;
     g_logging = FALSE;
     g_managerEnabled = TRUE;
+    g_borderless = FALSE;
 
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\%hs", g_moduleDir, CONFIG_NAME);
@@ -404,6 +413,10 @@ static void parse_config(void)
         else if (_wcsnicmp(line, L"Logging=", 8) == 0)
         {
             g_logging = parse_bool_value(line + 8);
+        }
+        else if (_wcsnicmp(line, L"Borderless=", 11) == 0)
+        {
+            g_borderless = parse_bool_value(line + 11);
         }
 
         line = wcstok(NULL, L"\n", &ctx);
@@ -1207,11 +1220,84 @@ static void load_plugins_from(const wchar_t *modDir)
  */
 /* Runs a few seconds after startup so the mod's own loader has finished its
    plugin pass; logs which mod modules actually made it into the process. */
+static void log_hex_bytes(const wchar_t *label, const void *p, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    wchar_t buf[256];
+    int off = 0;
+    buf[0] = L'\0';
+    off += _snwprintf(buf + off, 255 - (size_t)off, L"%ls @ %p:", label, p);
+    for (size_t i = 0; i < n && off < 220; i++)
+        off += _snwprintf(buf + off, 255 - (size_t)off, L" %02X", b[i]);
+    log_line(L"%ls", buf);
+}
+
+/* Dump the memory our standalone ASI hook sites + the crash site live in, so
+   the runtime state can be checked when a standalone ASI crashes the game. */
+static void dump_patch_sites(void)
+{
+    HMODULE game = GetModuleHandleW(NULL);
+    if (game == NULL)
+        return;
+
+    log_line(L"--- patch site memory (game base %p) ---", (void *)game);
+
+    /* QuickStarter2026.asi hook sites (deterministic offsets) */
+    log_hex_bytes(L"site 0x217763", (BYTE *)game + 0x217763 - 0x10, 0x28);
+    log_hex_bytes(L"site 0x217785", (BYTE *)game + 0x217785, 0x20);
+    log_hex_bytes(L"site 0x2122af", (BYTE *)game + 0x2122af - 0x10, 0x20);
+    log_hex_bytes(L"site 0x2122bf", (BYTE *)game + 0x2122bf - 0x10, 0x20);
+    log_hex_bytes(L"site 0x2122de", (BYTE *)game + 0x2122de - 0x10, 0x20);
+    log_hex_bytes(L"site 0x211f6b", (BYTE *)game + 0x211f6b - 0x10, 0x20);
+
+    HMODULE qs = GetModuleHandleW(L"QuickStarter2026.asi");
+    if (qs == NULL)
+    {
+        log_line(L"QuickStarter2026.asi NOT loaded in process");
+        return;
+    }
+    log_line(L"QuickStarter2026.asi @ %p", (void *)qs);
+    log_line(L"  switch(0x478)=0x%02X  gamebase(0x490)=%p  tlsIdx(0x4b0)=%lu",
+             *(unsigned char *)((BYTE *)qs + 0x478), *(void **)((BYTE *)qs + 0x490),
+             *(unsigned long *)((BYTE *)qs + 0x4b0));
+
+    /* walk the ASI's trampoline buffer list */
+    void *head = *(void **)((BYTE *)qs + 0x488);
+    for (int i = 0; i < 4 && head != NULL; i++)
+    {
+        void *buf = *(void **)((BYTE *)head + 0x8);
+        unsigned long long size = (unsigned long long)(*(ULONG_PTR *)((BYTE *)head + 0x10));
+        log_line(L"  tramp[%d] head=%p buf=%p size=%llu", i, head, buf, size);
+        if (buf != NULL)
+            log_hex_bytes(L"    bytes", buf, 16);
+        head = *(void **)head;
+    }
+}
+
 static DWORD WINAPI diagnostic_thread(LPVOID param)
 {
     (void)param;
-    Sleep(2000);
-    log_line(L"--- module state (2s after startup) ---");
+    HMODULE game = GetModuleHandleW(NULL);
+    HMODULE qs = GetModuleHandleW(L"QuickStarter2026.asi");
+
+    /* Poll every 200ms: ASI switch byte, patch state at the hook sites, and
+       the crash-site bytes (encrypted vs decrypted). */
+    for (int i = 0; i < 25; i++)
+    {
+        Sleep(200);
+        DWORD tick = GetTickCount();
+        BYTE sw = 0;
+        if (qs != NULL)
+            sw = *(volatile BYTE *)((BYTE *)qs + 0x478);
+        const BYTE *p217763 = (const BYTE *)game + 0x217763;
+        const BYTE *p217785 = (const BYTE *)game + 0x217785;
+        log_line(L"[%lu] sw=0x%02X site217763=%02X%02X%02X%02X%02X crashSite=%02X%02X%02X%02X",
+                 tick, sw,
+                 p217763[0], p217763[1], p217763[2], p217763[3], p217763[4],
+                 p217785[0], p217785[1], p217785[2], p217785[3]);
+    }
+    log_line(L"--- module state (5s after startup) ---");
+    dump_patch_sites();
     wchar_t cwd[MAX_PATH];
     if (GetCurrentDirectoryW(MAX_PATH, cwd) > 0)
         log_line(L"process CWD = %ls", cwd);
@@ -1269,10 +1355,359 @@ static void run_mod_manager(void)
         ExitProcess(0);
 }
 
+/* ------------------------------------------------------------------ */
+/* borderless fullscreen                                               */
+/* ------------------------------------------------------------------ */
+/* When [Loader] Borderless=1 is set, the game's real fullscreen (which
+   switches the display mode) is replaced with a borderless window that
+   covers the monitor. Three cooperating mechanisms:
+     - the d3d9 device is forced to Windowed=TRUE on create/reset;
+     - user32 ChangeDisplaySettings(W/A/ExW/ExA) fullscreen mode changes
+       are swallowed;
+     - a watchdog thread re-asserts the borderless style every 2 seconds
+       in case the game re-sizes its window after a transition.
+   All hooks gate on g_borderless, so nothing happens unless the user
+   checks the option in the mod manager. */
+
+static HWND g_gameHwnd    = NULL;
+
+static IDirect3D9 *(WINAPI *RealDirect3DCreate9)(UINT SDKVersion) = NULL;
+static HRESULT (WINAPI *RealD3D9CreateDevice)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD,
+                                              D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **) = NULL;
+static HRESULT (WINAPI *RealD3D9Reset)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *) = NULL;
+
+static LONG (WINAPI *RealChangeDisplaySettingsW)(LPDEVMODEW, DWORD) = NULL;
+static LONG (WINAPI *RealChangeDisplaySettingsA)(LPDEVMODEA, DWORD) = NULL;
+static LONG (WINAPI *RealChangeDisplaySettingsExW)(LPCWSTR, LPDEVMODEW, HWND, DWORD, LPVOID) = NULL;
+static LONG (WINAPI *RealChangeDisplaySettingsExA)(LPCSTR, LPDEVMODEA, HWND, DWORD, LPVOID) = NULL;
+
+static BOOL CALLBACK borderless_enum_proc(HWND hwnd, LPARAM lp)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId())
+        return TRUE;
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+        return TRUE;
+    if (GetWindowTextLengthW(hwnd) == 0)
+        return TRUE;
+    *(HWND *)lp = hwnd;
+    return FALSE;
+}
+
+/* The game's main window, remembered from device calls and verified before
+   reuse, with a foreground/EnumWindows fallback for startup ordering. */
+static HWND find_game_window(void)
+{
+    if (g_gameHwnd != NULL && IsWindow(g_gameHwnd))
+        return g_gameHwnd;
+
+    g_gameHwnd = NULL;
+    HWND fg = GetForegroundWindow();
+    if (fg != NULL)
+    {
+        DWORD fgpid = 0;
+        GetWindowThreadProcessId(fg, &fgpid);
+        if (fgpid == GetCurrentProcessId() && GetWindowTextLengthW(fg) > 0)
+        {
+            g_gameHwnd = fg;
+            return fg;
+        }
+    }
+    EnumWindows(borderless_enum_proc, (LPARAM)&g_gameHwnd);
+    return g_gameHwnd;
+}
+
+/* Strip the caption/border and stretch the window to cover its monitor. */
+static void make_window_borderless(HWND hwnd)
+{
+    if (hwnd == NULL || !IsWindow(hwnd))
+        return;
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR want = (style & ~(WS_OVERLAPPEDWINDOW | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+    if (want != style)
+        SetWindowLongPtrW(hwnd, GWL_STYLE, want);
+
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi))
+    {
+        SetWindowPos(hwnd, HWND_TOP,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+}
+
+/* IDirect3DDevice9::Reset is vtable slot 16. */
+static HRESULT WINAPI HookD3D9Reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *params)
+{
+    D3DPRESENT_PARAMETERS orig;
+    BOOL borderless = g_borderless && params != NULL && !params->Windowed;
+    if (borderless)
+    {
+        orig = *params;
+        params->Windowed = TRUE;
+        params->FullScreen_RefreshRateInHz = 0;
+        if (params->hDeviceWindow == NULL)
+            params->hDeviceWindow = find_game_window();
+        else
+            g_gameHwnd = params->hDeviceWindow;
+    }
+    HRESULT hr = RealD3D9Reset(dev, params);
+    if (borderless && FAILED(hr))
+    {
+        *params = orig;
+        hr = RealD3D9Reset(dev, params);
+        log_line(L"borderless: windowed reset failed (0x%08X), retried fullscreen", (unsigned)hr);
+    }
+    if (borderless && SUCCEEDED(hr))
+        make_window_borderless(params->hDeviceWindow);
+    return hr;
+}
+
+static void hook_device_reset(IDirect3DDevice9 *dev)
+{
+    if (dev == NULL)
+        return;
+    LPVOID *vt = *(LPVOID **)dev;
+    if (vt == NULL || vt[16] == NULL)
+        return;
+    if (vt[16] == (LPVOID)HookD3D9Reset)
+        return;
+    if (MH_CreateHook(vt[16], &HookD3D9Reset, (LPVOID *)&RealD3D9Reset) == MH_OK)
+    {
+        if (MH_EnableHook(vt[16]) == MH_OK)
+            log_line(L"borderless: d3d9 Reset hooked at %p", vt[16]);
+    }
+    else
+    {
+        /* Another plugin may already hook this slot; the original is still
+           reachable through the existing hook, so we simply skip it. */
+        log_line(L"borderless: d3d9 Reset hook skipped (already hooked)");
+    }
+}
+
+/* IDirect3D9::CreateDevice is vtable slot 16. */
+static HRESULT WINAPI HookD3D9CreateDevice(IDirect3D9 *d3d9, UINT adapter, D3DDEVTYPE devType,
+                                           HWND hFocus, DWORD behavior,
+                                           D3DPRESENT_PARAMETERS *params,
+                                           IDirect3DDevice9 **device)
+{
+    D3DPRESENT_PARAMETERS orig;
+    BOOL borderless = g_borderless && params != NULL && !params->Windowed;
+    if (borderless)
+    {
+        orig = *params;
+        params->Windowed = TRUE;
+        params->FullScreen_RefreshRateInHz = 0;
+        if (params->hDeviceWindow != NULL)
+            g_gameHwnd = params->hDeviceWindow;
+    }
+    HRESULT hr = RealD3D9CreateDevice(d3d9, adapter, devType, hFocus, behavior, params, device);
+    if (borderless && FAILED(hr))
+    {
+        *params = orig;
+        hr = RealD3D9CreateDevice(d3d9, adapter, devType, hFocus, behavior, params, device);
+        log_line(L"borderless: windowed device create failed (0x%08X), retried fullscreen", (unsigned)hr);
+    }
+    if (SUCCEEDED(hr) && device != NULL && *device != NULL)
+    {
+        hook_device_reset(*device);
+        if (borderless)
+        {
+            make_window_borderless(params->hDeviceWindow != NULL ? params->hDeviceWindow : g_gameHwnd);
+            log_line(L"borderless: device created windowed");
+        }
+    }
+    return hr;
+}
+
+static IDirect3D9 *WINAPI HookDirect3DCreate9(UINT sdkVersion)
+{
+    IDirect3D9 *d3d9 = RealDirect3DCreate9(sdkVersion);
+    if (d3d9 != NULL)
+    {
+        LPVOID *vt = *(LPVOID **)d3d9;
+        if (vt != NULL && vt[16] != NULL && vt[16] != (LPVOID)HookD3D9CreateDevice)
+        {
+            if (MH_CreateHook(vt[16], &HookD3D9CreateDevice, (LPVOID *)&RealD3D9CreateDevice) == MH_OK)
+            {
+                if (MH_EnableHook(vt[16]) == MH_OK)
+                    log_line(L"borderless: d3d9 CreateDevice hooked at %p", vt[16]);
+            }
+            else
+            {
+                log_line(L"borderless: d3d9 CreateDevice hook skipped (already hooked)");
+            }
+        }
+    }
+    return d3d9;
+}
+
+/* Swallow the game's fullscreen mode changes. Returns FALSE to pass through. */
+static BOOL borderless_swallow(const DEVMODEW *dm, DWORD flags)
+{
+    if (!g_borderless || dm == NULL)
+        return FALSE;
+    if (flags & CDS_FULLSCREEN)
+        return TRUE;
+    if (dm->dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT))
+        return TRUE;
+    return FALSE;
+}
+
+static BOOL borderless_swallow_a(const DEVMODEA *dm, DWORD flags)
+{
+    if (!g_borderless || dm == NULL)
+        return FALSE;
+    if (flags & CDS_FULLSCREEN)
+        return TRUE;
+    if (dm->dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT))
+        return TRUE;
+    return FALSE;
+}
+
+static LONG WINAPI HookChangeDisplaySettingsW(LPDEVMODEW dm, DWORD flags)
+{
+    if (borderless_swallow(dm, flags))
+    {
+        log_line(L"borderless: ChangeDisplaySettingsW fullscreen -> borderless");
+        make_window_borderless(find_game_window());
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+    return RealChangeDisplaySettingsW(dm, flags);
+}
+
+static LONG WINAPI HookChangeDisplaySettingsA(LPDEVMODEA dm, DWORD flags)
+{
+    if (borderless_swallow_a(dm, flags))
+    {
+        log_line(L"borderless: ChangeDisplaySettingsA fullscreen -> borderless");
+        make_window_borderless(find_game_window());
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+    return RealChangeDisplaySettingsA(dm, flags);
+}
+
+static LONG WINAPI HookChangeDisplaySettingsExW(LPCWSTR name, LPDEVMODEW dm, HWND hwnd,
+                                                DWORD flags, LPVOID param)
+{
+    if (borderless_swallow(dm, flags))
+    {
+        log_line(L"borderless: ChangeDisplaySettingsExW fullscreen -> borderless");
+        make_window_borderless(find_game_window());
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+    return RealChangeDisplaySettingsExW(name, dm, hwnd, flags, param);
+}
+
+static LONG WINAPI HookChangeDisplaySettingsExA(LPCSTR name, LPDEVMODEA dm, HWND hwnd,
+                                                DWORD flags, LPVOID param)
+{
+    if (borderless_swallow_a(dm, flags))
+    {
+        log_line(L"borderless: ChangeDisplaySettingsExA fullscreen -> borderless");
+        make_window_borderless(find_game_window());
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+    return RealChangeDisplaySettingsExA(name, dm, hwnd, flags, param);
+}
+
+static void install_borderless_hooks(void)
+{
+    LoadLibraryW(L"d3d9.dll");
+    MH_CreateHookApi(L"d3d9.dll", "Direct3DCreate9",
+                     &HookDirect3DCreate9, (LPVOID *)&RealDirect3DCreate9);
+    MH_CreateHookApi(L"user32.dll", "ChangeDisplaySettingsW",
+                     &HookChangeDisplaySettingsW, (LPVOID *)&RealChangeDisplaySettingsW);
+    MH_CreateHookApi(L"user32.dll", "ChangeDisplaySettingsA",
+                     &HookChangeDisplaySettingsA, (LPVOID *)&RealChangeDisplaySettingsA);
+    MH_CreateHookApi(L"user32.dll", "ChangeDisplaySettingsExW",
+                     &HookChangeDisplaySettingsExW, (LPVOID *)&RealChangeDisplaySettingsExW);
+    MH_CreateHookApi(L"user32.dll", "ChangeDisplaySettingsExA",
+                     &HookChangeDisplaySettingsExA, (LPVOID *)&RealChangeDisplaySettingsExA);
+    MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
+    log_line(L"borderless: hooks installed (MH status=%d, D3D9=%p)",
+             (int)st, (void *)RealDirect3DCreate9);
+}
+
+/* Safety net: some games re-apply their own window style/size after switching
+   modes, so re-assert the borderless look whenever the game window has no
+   caption (i.e. it is in a fullscreen-ish state). Never touches a normal
+   windowed-mode window (which keeps WS_CAPTION). */
+static DWORD WINAPI borderless_thread(LPVOID param)
+{
+    (void)param;
+    for (;;)
+    {
+        Sleep(2000);
+        if (!g_borderless)
+            continue;
+        HWND hwnd = find_game_window();
+        if (hwnd == NULL)
+            continue;
+        if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CAPTION)
+            continue;
+        make_window_borderless(hwnd);
+    }
+    return 0;
+}
+
+static void start_borderless_thread(void)
+{
+    CreateThread(NULL, 0, borderless_thread, NULL, 0, NULL);
+}
+
+/* Standalone .asi/.dll plugins cannot be loaded at GetStartupInfoW-time: the
+   game lazily decompresses/re-encrypts its code pages during boot, so hooks
+   written before the decompressor reaches a page get clobbered and the game
+   crashes (0xc000001d at the half-decompressed boundary).  The CE/UAL loader
+   avoids this because its ASIs are only loaded later in the boot.
+   We load standalone plugins from a delayed thread so their patches land after
+   the game's code pages are committed. */
+static void load_standalone_plugins(void)
+{
+    for (int i = 0; i < g_modCount; i++)
+    {
+        if (RealGetFileAttributesW(g_mods[i]) == INVALID_FILE_ATTRIBUTES)
+            continue;
+        if (!mod_has_loader(g_mods[i]))
+            load_plugins_from(g_mods[i]);
+    }
+    log_line(L"standalone plugins loaded (delayed)");
+}
+
+static DWORD WINAPI standalone_delay_thread(LPVOID param)
+{
+    (void)param;
+    Sleep(2500);
+    load_standalone_plugins();
+    return 0;
+}
+
+static void load_standalone_plugins_deferred(void)
+{
+    if (InterlockedCompareExchange(&g_standaloneLoaded, 1, 0) != 0)
+        return;
+    if (!g_enabled)
+        return;
+    CreateThread(NULL, 0, standalone_delay_thread, NULL, 0, NULL);
+}
+
 static void load_plugins_deferred(void)
 {
     if (InterlockedCompareExchange(&g_pluginsLoaded, 1, 0) != 0)
+    {
+        load_standalone_plugins_deferred();
         return;
+    }
 
     /* Mod manager first so the user can enable/disable mods before anything is
        loaded, then re-read mods.ini to pick up the changes. Shift-override:
@@ -1281,6 +1716,14 @@ static void load_plugins_deferred(void)
     if (g_managerEnabled || (GetAsyncKeyState(VK_SHIFT) & 0x8000))
         run_mod_manager();
     parse_config();
+
+    /* Borderless fullscreen is independent of the mods master switch, so set it
+       up before the g_enabled early-out. */
+    if (g_borderless)
+    {
+        install_borderless_hooks();
+        start_borderless_thread();
+    }
 
     if (!g_enabled)
         return;
@@ -1294,10 +1737,8 @@ static void load_plugins_deferred(void)
         }
         if (mod_has_loader(g_mods[i]))
             load_mod_loader(g_mods[i]);
-        else
-            load_plugins_from(g_mods[i]);
     }
-    log_line(L"plugins loaded (deferred)");
+    log_line(L"mod loaders loaded (deferred)");
     CreateThread(NULL, 0, diagnostic_thread, NULL, 0, NULL);
 }
 

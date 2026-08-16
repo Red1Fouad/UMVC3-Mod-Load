@@ -25,6 +25,7 @@
  *   Enabled=1        <- master switch (checkbox)
  *   Manager=1        <- window always shows on launch
  *   Logging=0        <- preserved from previous runs
+ *   Borderless=0     <- borderless fullscreen instead of mode-switch fullscreen
  *
  *   [Mods]           <- every known mod, in priority order (1 wins)
  *   1=C:\path\to\MyMod
@@ -61,6 +62,7 @@
 #define IDC_STATUS     108
 #define IDC_DOWN       109
 #define IDC_HINT       110
+#define IDC_BORDERLESS 111
 
 typedef struct
 {
@@ -84,6 +86,7 @@ static FileMod  g_fileMods[MAX_MODS];
 static int      g_fileModCount  = 0;
 static BOOL     g_masterEnabled = TRUE;
 static BOOL     g_logging       = FALSE;
+static BOOL     g_borderless    = FALSE;
 static wchar_t  g_baseDir[MAX_PATH_LEN];
 static wchar_t  g_configPath[MAX_PATH_LEN];
 
@@ -104,6 +107,7 @@ static BOOL     g_gameIndexBuilt = FALSE;
 static HWND g_hwnd     = NULL;
 static HWND g_list     = NULL;
 static HWND g_master   = NULL;
+static HWND g_borderlessCtl = NULL;
 static HWND g_status   = NULL;
 static HWND g_hint     = NULL;
 static HWND g_startBtn = NULL;
@@ -177,6 +181,7 @@ static BOOL read_mods_ini(void)
     g_fileModCount = 0;
     g_masterEnabled = TRUE;
     g_logging = FALSE;
+    g_borderless = FALSE;
 
     HANDLE h = CreateFileW(g_configPath, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -277,6 +282,8 @@ static BOOL read_mods_ini(void)
             g_logging = parse_bool(line + 8);
         else if (_wcsnicmp(line, L"Log=", 4) == 0)
             g_logging = parse_bool(line + 4);
+        else if (_wcsnicmp(line, L"Borderless=", 11) == 0)
+            g_borderless = parse_bool(line + 11);
         line = wcstok(NULL, L"\n", &ctx);
     }
     return TRUE;
@@ -290,12 +297,14 @@ static void write_mods_ini(void)
         for (int i = 0; i < g_modCount; i++)
             g_mods[i].enabled = ListView_GetCheckState(g_list, i) != 0;
     }
+    if (g_borderlessCtl != NULL)
+        g_borderless = (SendMessageW(g_borderlessCtl, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
     wchar_t out[8192];
     int len = 0;
     len += _snwprintf(out + len, 8191 - len,
-                      L"[Loader]\r\nVersion=1\r\nEnabled=%d\r\nManager=1\r\nLogging=%d\r\n",
-                      g_masterEnabled ? 1 : 0, g_logging ? 1 : 0);
+                      L"[Loader]\r\nVersion=1\r\nEnabled=%d\r\nManager=1\r\nLogging=%d\r\nBorderless=%d\r\n",
+                      g_masterEnabled ? 1 : 0, g_logging ? 1 : 0, g_borderless ? 1 : 0);
     len += _snwprintf(out + len, 8191 - len, L"\r\n[Mods]\r\n");
     for (int i = 0; i < g_modCount; i++)
         len += _snwprintf(out + len, 8191 - len, L"%d=%ls\r\n", i + 1, g_mods[i].path);
@@ -838,6 +847,11 @@ static void layout_controls(HWND hwnd)
     }
     y += 24;
 
+    /* Second row: borderless fullscreen checkbox. */
+    if (g_borderlessCtl != NULL)
+        MoveWindow(g_borderlessCtl, margin, y, 240, 20, TRUE);
+    y += 24;
+
     int btnW = 90, btnH = 26, gap = 6, launchW = btnW + 18;
     int listBottom = h - margin - btnH - 10;
     if (listBottom <= y)
@@ -1033,6 +1047,12 @@ static void create_window(HINSTANCE hInst)
                              0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_MASTER, hInst, NULL);
     SendMessageW(g_master, BM_SETCHECK, g_masterEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_master, WM_SETFONT, (WPARAM)font, TRUE);
+
+    g_borderlessCtl = CreateWindowW(L"BUTTON", L"Borderless fullscreen",
+                                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                    0, 0, 0, 0, g_hwnd, (HMENU)(INT_PTR)IDC_BORDERLESS, hInst, NULL);
+    SendMessageW(g_borderlessCtl, BM_SETCHECK, g_borderless ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_borderlessCtl, WM_SETFONT, (WPARAM)font, TRUE);
 
     g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
